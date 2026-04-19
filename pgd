@@ -1,0 +1,222 @@
+#!/bin/bash
+
+# --- Configuration ---
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONF="$SCRIPT_DIR/pgd.conf"
+LOG="$SCRIPT_DIR/pgd.log"
+PID=""
+
+# --- Utility Functions ---
+_pgd_log() {
+    local msg="$1"
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$ts] $msg"
+    echo "[$ts] $msg" >> "$LOG"
+}
+
+_get_pid() {
+    local pid
+    pid=$(ps -ef | grep "pgd daemon" | grep -v grep | awk '{print $2}' | head -1)
+    PID="$pid"
+}
+
+# --- Main Logic ---
+case "$1" in
+    list)
+        echo "--- PGD Config ---"
+        [ -f "$CONF" ] && cat "$CONF" || echo "No config file found."
+        ;;
+
+    log)
+        if [ -f "$LOG" ]; then
+            cat "$LOG"
+        else
+            echo "No log file found."
+        fi
+        ;;
+
+    add)
+        NAME="$2"; CMD="$3"; INT="$4"
+        [ -z "$NAME" ] || [ -z "$CMD" ] || [ -z "$INT" ] && { echo "Usage: ./pgd add <name> <cmd> <int>"; exit 1; }
+        printf "%s:%s:%s\n" "$NAME" "$CMD" "$INT" >> "$CONF"
+        echo "Added $NAME"
+        _get_pid
+        [ -n "$PID" ] && kill -HUP "$PID" && echo "Notified $PID"
+        ;;
+
+    delete)
+        NAME="$2"
+        [ -z "$NAME" ] && { echo "Usage: ./pgd delete <name>"; exit 1; }
+        [ -f "$CONF" ] && sed -i "/^$NAME:/d" "$CONF" && echo "Removed $NAME"
+        _get_pid
+        [ -n "$PID" ] && kill -HUP "$PID" && echo "Notified $PID"
+        ;;
+
+    status)
+        _get_pid
+        echo "--- PGD Service Status ---"
+        if [ -n "$PID" ]; then
+            echo "[ RUNNING ] Daemon (PID: $PID)"
+        else
+            echo "[ STOPPED ] Daemon"
+        fi
+        echo "--- PGD Monitored Tasks Status ---"
+        if [ -f "$CONF" ]; then
+            while IFS=':' read -r n c i || [ -n "$n" ]; do
+                [ -z "$n" ] || [ "$n" == "#"* ] && continue
+                n_clean=$(echo "$n" | tr -d '\r\n[:]')
+                c_clean=$(echo "$c" | tr -d '\r\n[:]')
+                pid=$(pgrep -f "$c_clean" | head -1)
+                if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                    echo "[ RUNNING ] $n (PID: $pid)"
+                else
+                    echo "[ STOPPED ] $n (Cmd: $c_clean)"
+                fi
+            done < <(tr -d '\r' < "$CONF")
+        else
+            echo "No configuration file."
+        fi
+        ;;
+
+    stop)
+        _get_pid
+        if [ -n "$PID" ]; then
+            kill "$PID" 2>/dev/null
+            echo "Daemon stopped (PID: $PID)."
+        else
+            echo "No running daemon found."
+        fi
+        ;;
+
+    daemon)
+        echo "[$(date)] Daemon started" >> "$LOG"
+        declare -A MONITORED_PROCS
+        declare -A RESTART_CMDS
+        declare -A INTERVALS
+        declare -A LAST_CHECK
+        declare -A PIDS
+
+        MONITORED_PROCS=()
+        RESTART_CMDS=()
+        INTERVALS=()
+        LAST_CHECK=()
+        PIDS=()
+
+        reload_config() {
+            _pgd_log "Reloading configuration..."
+
+            MONITORED_PROCS=()
+            RESTART_CMDS=()
+            INTERVALS=()
+            PIDS=()
+
+            if [ -f "$CONF" ]; then
+                while IFS=':' read -r n c i || [ -n "$n" ]; do
+                    [ -z "$n" ] || [ "$n" == "#"* ] && continue
+                    n_clean=$(echo "$n" | tr -d '\r\n[:]')
+                    c_clean=$(echo "$c" | tr -d '\r\n[:]')
+                    i_clean=$(echo "$i" | tr -d '\r\n[:]')
+                    MONITORED_PROCS["$n_clean"]=1
+                    RESTART_CMDS["$n_clean"]="$c_clean"
+                    INTERVALS["$n_clean"]="${i_clean:-5}"
+                done < <(tr -d '\r' < "$CONF")
+            fi
+        }
+
+        reload_config
+        trap 'reload_config' SIGHUP
+
+        while true; do
+            for n in "${!MONITORED_PROCS[@]}"; do
+                c="${RESTART_CMDS[$n]}"
+                interval="${INTERVALS[$n]:-5}"
+                curr_time=$(date +%s)
+                last_check="${LAST_CHECK[$n]:-0}"
+                elapsed=$((curr_time - last_check))
+
+                if [ "$elapsed" -ge "$interval" ]; then
+                    LAST_CHECK[$n]=$curr_time
+                    pid="${PIDS[$n]}"
+                    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                        continue
+                    fi
+
+                    _pgd_log "ALERT: $n is down. Restarting ($c)..."
+                    bash -c "$c" >> "$LOG" 2>&1 &
+                    PIDS[$n]=$!
+                fi
+            done
+            sleep 1
+        done
+        ;;
+
+    register)
+        SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+        USER_HOME=$(eval echo ~$USER)
+        SERVICE_FILE="$USER_HOME/.config/systemd/user/pgd.service"
+
+        echo "Registering pgd as a systemd user service..."
+        mkdir -p "$USER_HOME/.config/systemd/user/"
+
+        # Create Service Unit file
+        cat <<EOF > "$SERVICE_FILE"
+[Unit]
+Description=PGD Process Guardian Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$SCRIPT_DIR/pgd daemon
+WorkingDirectory=$HOME
+Restart=always
+
+[Install]
+WantedBy=default.target
+EOF
+
+        # Reload systemd and start
+        systemctl --user daemon-reload
+        systemctl --user enable pgd.service
+        systemctl --user start pgd.service
+        echo "Successfully registered and started pgd service."
+        ;;
+
+    unregister)
+        echo "Unregistering pgd service..."
+        systemctl --user stop pgd.service
+        systemctl --user disable pgd.service
+        # Optional: whether to remove the file
+        # rm "$USER_HOME/.config/systemd/user/pgd.service"
+        # systemctl --user daemon-reload
+        echo "PGD service has been unregistered."
+        ;;
+
+    install)
+        SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+        TARGET_DIR="$HOME/bin"
+        mkdir -p "$TARGET_DIR"
+        cp "$SCRIPT_DIR/pgd" "$TARGET_DIR/pgd"
+        chmod +x "$TARGET_DIR/pgd"
+        echo "Installed pgd to $TARGET_DIR/pgd"
+        echo "You can now run 'pgd' from anywhere."
+        if [[ ":$PATH:" != *":$TARGET_DIR:"* ]]; then
+            echo "Note: Add $TARGET_DIR to your PATH if not already added."
+        fi
+        ;;
+
+    *)
+        echo "Usage: ./pgd {daemon|add|delete|list|log|status|stop|register|unregister|install}"
+        echo "  daemon        Start the PGD monitoring daemon"
+        echo "  add <name> <cmd> <int>  Add a new monitored task (name, command, interval)"
+        echo "  delete <name>          Remove a monitored task"
+        echo "  list          List all configured tasks"
+        echo "  log           Display the log file"
+        echo "  status        Show daemon and task status"
+        echo "  stop          Stop the PGD daemon"
+        echo "  register      Register PGD as a systemd user service"
+        echo "  unregister    Unregister the PGD systemd service"
+        echo "  install       Install pgd to system PATH"
+        exit 1
+        ;;
+esac
